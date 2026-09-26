@@ -1252,7 +1252,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
     // Protect against the easy-to-miss static ShouldInterruptSpDash ABI.
     using FlagsFn = uint32_t(*)(const void*, uint32_t*);
     auto flags = reinterpret_cast<FlagsFn>(GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"), "il2cpp_method_get_flags"));
-    if (!flags) return BE_Result_ContractMismatch;
+    if (!flags) { Log("Action contract: il2cpp_method_get_flags is not exported."); return BE_Result_ContractMismatch; }
     for (int i = Start; i <= Release; ++i) {
         uint32_t impl = 0;
         bool is_static = (flags(g_methods[i].resolved.method_info, &impl) & 0x10u) != 0;
@@ -1320,7 +1320,8 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
     g_locomotion_fields[0] = static_field(kView, "CharacterAnimationBlackboard", "HASH_STATE_RUN");
     g_locomotion_fields[1] = static_field(kView, "CharacterAnimationBlackboard", "HASH_STATE_SPRINT");
     uint32_t impl = 0;
-    if (!ok || !g_hash_fields[0] || !g_hash_fields[1] || !g_locomotion_fields[0] || !g_locomotion_fields[1] ||
+    if (!ok) { Log("Action contract: an enum constant or static field could not be read."); return BE_Result_ContractMismatch; }
+    if (!g_hash_fields[0] || !g_hash_fields[1] || !g_locomotion_fields[0] || !g_locomotion_fields[1] ||
         (flags(g_methods[SetDashing].resolved.method_info, &impl) & 0x10u)) return BE_Result_ContractMismatch;
     for (MethodId id : {FlowTick, PerformClear, AddCommand, TickStateInterrupt, CrossFade, TryExit,
         CheckTrackEnd, ShowObject, AudioMonoPost, AudioMonoComponent, EffectDuration, EffectFinish, EffectStop})

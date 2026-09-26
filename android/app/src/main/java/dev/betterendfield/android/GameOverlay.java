@@ -128,6 +128,13 @@ final class GameOverlay {
     private GameOverlay(Activity activity, boolean preview, Supplier<OverlayFeatures> features) {
         this.activity = activity;
         this.preview = preview;
+        // The overlay runs in the game process under the game's class loader,
+        // so it never sees RuntimeBootstrap's static mailbox (a different
+        // class-loader copy). Derive the same path from this process's own
+        // cache directory and register it locally.
+        java.io.File box = new java.io.File(activity.getCacheDir(),
+                "betterendfield-keys/keys.box");
+        NativeCommandBridge.configure(box);
         this.features = features;
 
         host = new FrameLayout(activity);

@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -113,6 +114,71 @@ void RunModules() {
     }
 }
 
+// The in-game panel runs under LSPosed's class loader, which ART rejects for
+// native method resolution, so the overlay cannot call JNI directly. Both sides
+// live in the game process, so the panel appends "K vk action" / "A" / "C cmd"
+// lines to a mailbox file and this worker feeds them into the same virtual-key
+// latch and command pump the desktop modules already poll.
+void RunKeyMailbox() {
+    // JNI_OnLoad runs before RuntimeBootstrap publishes the environment, so
+    // wait for the path to appear instead of reading it once at start-up.
+    const char* path = nullptr;
+    for (int attempt = 0; attempt < 1200; ++attempt) {
+        path = std::getenv("BETTER_ENDFIELD_KEY_MAILBOX");
+        if (path != nullptr && path[0] != '\0') break;
+        std::this_thread::sleep_for(kPollInterval);
+    }
+    if (path == nullptr || path[0] == '\0') {
+        LogInfo("input", "key mailbox not configured");
+        return;
+    }
+    LogInfo("input", (std::string("key mailbox polling: ") + path).c_str());
+    size_t consumed = 0;
+    std::string pending;
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        FILE* file = std::fopen(path, "rb");
+        if (file == nullptr) continue;
+        if (std::fseek(file, 0, SEEK_END) != 0) { std::fclose(file); continue; }
+        const long size = std::ftell(file);
+        if (size < 0) { std::fclose(file); continue; }
+        if (static_cast<size_t>(size) < consumed) {
+            // The panel recreated the file after a failure; start over.
+            consumed = 0;
+            pending.clear();
+        }
+        if (static_cast<size_t>(size) > consumed) {
+            std::fseek(file, static_cast<long>(consumed), SEEK_SET);
+            std::string chunk(static_cast<size_t>(size - consumed), '\0');
+            const size_t read = std::fread(&chunk[0], 1, chunk.size(), file);
+            chunk.resize(read);
+            consumed += read;
+            pending += chunk;
+            size_t newline;
+            while ((newline = pending.find('\n')) != std::string::npos) {
+                const std::string line = pending.substr(0, newline);
+                pending.erase(0, newline + 1);
+                size_t body = line.find_first_not_of(" \t\r");
+                if (body == std::string::npos) continue;
+                const std::string record = line.substr(body);
+                if (record.size() >= 2 && record[0] == 'K') {
+                    int vk = 0; int action = 0;
+                    if (std::sscanf(record.c_str() + 1, " %d %d", &vk, &action) == 2) {
+                        betterendfield::SetVirtualKey(vk,
+                            static_cast<betterendfield::VirtualKeyAction>(action));
+                    }
+                } else if (record == "A") {
+                    betterendfield::ReleaseAllVirtualKeys();
+                } else if (record.size() > 2 && record[0] == 'C') {
+                    const std::string payload = record.substr(2);
+                    betterendfield::SubmitRuntimeCommand(payload.c_str(), payload.size());
+                }
+            }
+        }
+        std::fclose(file);
+    }
+}
+
 bool AnyModuleRequested() {
     static constexpr const char* kVariables[]{
         "BETTER_ENDFIELD_VOICE_RULES",
@@ -140,43 +206,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
     }
     if (!betterendfield::g_runtime_started.exchange(true, std::memory_order_acq_rel)) {
         std::thread(betterendfield::RunModules).detach();
+        std::thread(betterendfield::RunKeyMailbox).detach();
     }
     return JNI_VERSION_1_6;
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_dev_betterendfield_android_NativeCommandBridge_submit(
-        JNIEnv* environment, jclass, jstring payload) {
-    if (!environment || !payload) return JNI_FALSE;
-    const char* text = environment->GetStringUTFChars(payload, nullptr);
-    if (!text) return JNI_FALSE;
-    const bool accepted = betterendfield::SubmitRuntimeCommand(text, std::strlen(text));
-    environment->ReleaseStringUTFChars(payload, text);
-    return accepted ? JNI_TRUE : JNI_FALSE;
-}
-
-extern "C" JNIEXPORT jstring JNICALL
-Java_dev_betterendfield_android_NativeCommandBridge_status(
-        JNIEnv* environment, jclass) {
-    if (!environment) return nullptr;
-    const std::string status = betterendfield::CopyRuntimeCommandStatus();
-    return environment->NewStringUTF(status.c_str());
-}
-
-// The in-game panel's controls. This deliberately bypasses the runtime command
-// pump: the pump is a single-slot, generation-checked queue drained on a Unity
-// hook, which is right for configuration but would drop the release event of a
-// press-and-hold control such as the free-camera movement pad. The latch is a
-// plain atomic, so a press is visible to the desktop polling code immediately.
-extern "C" JNIEXPORT jboolean JNICALL
-Java_dev_betterendfield_android_NativeCommandBridge_key(
-        JNIEnv*, jclass, jint virtual_key, jint action) {
-    return betterendfield::SetVirtualKey(
-        static_cast<int>(virtual_key),
-        static_cast<betterendfield::VirtualKeyAction>(action)) ? JNI_TRUE : JNI_FALSE;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_dev_betterendfield_android_NativeCommandBridge_releaseKeys(JNIEnv*, jclass) {
-    betterendfield::ReleaseAllVirtualKeys();
 }

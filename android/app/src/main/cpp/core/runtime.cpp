@@ -109,12 +109,52 @@ Il2CppRuntime::~Il2CppRuntime() {
     }
 }
 
+namespace {
+
+// When this library is registered against a module-owned class loader (needed
+// so ART can resolve the overlay's native methods), the bare-name
+// dlopen(RTLD_NOLOAD) runs in the wrong linker namespace and misses the
+// client's already-mapped libil2cpp.so. Scanning /proc/self/maps and dlopening
+// the absolute path returns the same in-memory image regardless of namespace.
+void* FindLoadedIl2Cpp() {
+    void* library = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+    if (library != nullptr) {
+        return library;
+    }
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (maps == nullptr) {
+        return nullptr;
+    }
+    char line[1024];
+    void* found = nullptr;
+    while (fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long start = 0;
+        unsigned long end = 0;
+        char perms[8] = {0};
+        char file[512] = {0};
+        if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %511s",
+                   &start, &end, perms, file) == 4) {
+            const size_t len = strlen(file);
+            if (len >= 12 && strcmp(file + len - 12, "libil2cpp.so") == 0) {
+                found = dlopen(file, RTLD_NOW | RTLD_NOLOAD);
+                if (found != nullptr) {
+                    break;
+                }
+            }
+        }
+    }
+    fclose(maps);
+    return found;
+}
+
+}  // namespace
+
 bool Il2CppRuntime::Connect() {
     if (library_ != nullptr) {
         return true;
     }
 
-    void* library = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+    void* library = FindLoadedIl2Cpp();
     if (library == nullptr) {
         return false;
     }
@@ -512,15 +552,18 @@ ResolvedField Il2CppRuntime::ResolveField(
         ? ResolvedField{} : ResolvedField{info, static_cast<int32_t>(offset)};
 }
 
+// A null instance is how IL2CPP reads a static field (enum literals, static
+// readonly constants). The desktop host accepts it the same way; the actions
+// module depends on it to resolve MovementComponent/CharInteractPerformEnums
+// constants without hard-coding numeric values.
 void* Il2CppRuntime::ReadFieldObject(
     const ResolvedField& field, void* instance) const {
-    return field.info == nullptr || instance == nullptr ||
-        field_get_value_object_ == nullptr
+    return field.info == nullptr || field_get_value_object_ == nullptr
         ? nullptr : field_get_value_object_(field.info, instance);
 }
 
 void* Il2CppRuntime::ReadFieldObject(const FieldInfo* field, void* instance) const {
-    return field == nullptr || instance == nullptr || field_get_value_object_ == nullptr
+    return field == nullptr || field_get_value_object_ == nullptr
         ? nullptr : field_get_value_object_(field, instance);
 }
 

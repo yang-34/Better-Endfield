@@ -145,7 +145,15 @@ Vector3 g_original_position{};
 Vector3 g_free_position{};
 float g_original_fov = 60.0f;
 float g_original_time_scale = 1.0f;
-bool g_changed_time_scale = false;
+std::atomic_bool g_changed_time_scale{false};
+
+// The frame pumps (TailLateTick / unscaledDeltaTime / camera tick) are the only
+// place toggle, freeze and unfreeze requests are consumed. Some game states
+// stop calling every one of those managed entry points once timeScale reaches
+// zero, which latches the world frozen with no way back. The pumps bump this
+// counter on every pass; the input thread watches it and, when it stalls while
+// a freeze is active, restores the time scale itself.
+std::atomic_uint64_t g_pump_progress{0};
 
 // ---------------------------------------------------------------------------
 // First-person tuning constants. The eye anchor follows the head bone, so the
@@ -548,10 +556,31 @@ bool GameWindowHasFocus() {
     return process_id == GetCurrentProcessId();
 }
 
+// Restores the time scale directly from the input thread. Only used when every
+// frame pump has stalled with the world frozen (see g_pump_progress): the
+// managed calls need this thread attached to the IL2CPP domain first, which the
+// same exports the rest of the runtime layer use provide.
+bool EmergencyRestoreTimeScale() {
+    using DomainGetFn = void* (*)();
+    using ThreadAttachFn = void* (*)(void*);
+    HMODULE game_assembly = GetModuleHandleW(L"GameAssembly.dll");
+    auto domain_get = reinterpret_cast<DomainGetFn>(
+        GetProcAddress(game_assembly, "il2cpp_domain_get"));
+    auto thread_attach = reinterpret_cast<ThreadAttachFn>(
+        GetProcAddress(game_assembly, "il2cpp_thread_attach"));
+    void* domain = domain_get ? domain_get() : nullptr;
+    if (!thread_attach || !domain || !thread_attach(domain)) {
+        return false;
+    }
+    return SetValue(Contract("unity.time.scale.set"), nullptr, g_original_time_scale);
+}
+
 void InputThreadMain() {
     bool toggle_was_down = false;
     bool pause_was_down = false;
     bool first_person_was_down = false;
+    uint64_t stalled_since = 0;
+    uint64_t last_pump_progress = 0;
     while (!g_input_thread_stop.load(std::memory_order_acquire)) {
         const bool free_enabled = g_free_camera_enabled.load(std::memory_order_acquire) &&
             g_free_camera_contract_ready;
@@ -568,6 +597,36 @@ void InputThreadMain() {
             (first_person_key == VK_OEM_MINUS && KeyDown(VK_SUBTRACT)) ||
             (first_person_key == VK_SUBTRACT && KeyDown(VK_OEM_MINUS));
         const bool first_person_down = focused && first_person_enabled && first_person_key_down;
+
+        // Stalled-pump watchdog: the world is frozen and the frame pumps have
+        // made no progress for 400 ms while a toggle or pause request is still
+        // pending. The request flags are sticky atomics, so a tapped key (a
+        // 180 ms pulse that is long gone by the time the pump stalls) still
+        // gets serviced. Restore the time scale here so the game can never be
+        // latched frozen by a game state that stops calling the pump hosts.
+        const uint64_t now = GetTickCount64();
+        const uint64_t pump_progress = g_pump_progress.load(std::memory_order_relaxed);
+        if (pump_progress != last_pump_progress) {
+            last_pump_progress = pump_progress;
+            stalled_since = 0;
+        } else if (stalled_since == 0) {
+            stalled_since = now;
+        } else if (now - stalled_since >= 400 &&
+            g_changed_time_scale.load(std::memory_order_acquire) &&
+            (g_toggle_request.load(std::memory_order_acquire) ||
+             g_pause_request.load(std::memory_order_acquire))) {
+            // The unfreeze itself is fulfilled here, so swallow the pause
+            // request; a toggle request stays pending so the resumed pump
+            // exits the free camera normally.
+            g_pause_request.store(false, std::memory_order_release);
+            if (EmergencyRestoreTimeScale()) {
+                g_changed_time_scale.store(false, std::memory_order_release);
+                Log("World time restored: stalled pump watchdog (ok)");
+            } else {
+                Log("World time restored: stalled pump watchdog (failed)");
+            }
+            stalled_since = 0;
+        }
 
         if (toggle_down && !toggle_was_down) {
             g_toggle_request.store(true, std::memory_order_release);
@@ -699,6 +758,9 @@ void ApplyFreeCamera() {
 }
 
 void PumpFreeCameraControl() {
+    // Any pass through a frame pump host proves the game is still ticking; the
+    // input-thread watchdog uses this to detect a fully stalled pump.
+    g_pump_progress.fetch_add(1, std::memory_order_relaxed);
     const bool allowed = g_free_camera_enabled.load(std::memory_order_acquire) &&
         g_free_camera_contract_ready;
 

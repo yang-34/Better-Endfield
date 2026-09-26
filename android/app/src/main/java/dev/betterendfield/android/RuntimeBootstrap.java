@@ -93,7 +93,20 @@ final class RuntimeBootstrap {
                     new File(context.getFilesDir(), "betterendfield/catalog").getAbsolutePath(), true);
             if (BuildConfig.DEBUG) Os.setenv("BETTER_ENDFIELD_DIAGNOSTICS_PATH",
                     new File(context.getCacheDir(), "betterendfield-diagnostics.log").getAbsolutePath(), true);
-            loadIntoTargetNamespace(library.getAbsolutePath(), context.getClassLoader(), application.getClass());
+            // The library is registered against the game loader only. ART
+            // refuses a second registration of the same file against another
+            // loader, and it rejects native resolution under LSPosed's loader
+            // outright, so the overlay controls do not call into JNI at all:
+            // they append to a mailbox file the runtime worker polls inside
+            // this same process (see NativeCommandBridge). The mailbox lives in
+            // the game's own cache dir because the overlay runs as the game uid.
+            loadIntoTargetNamespace(library.getAbsolutePath(),
+                    context.getClassLoader(), application.getClass());
+            File mailbox = new File(context.getCacheDir(), "betterendfield-keys");
+            if (!mailbox.isDirectory()) mailbox.mkdirs();
+            File boxFile = new File(mailbox, "keys.box");
+            Os.setenv("BETTER_ENDFIELD_KEY_MAILBOX", boxFile.getAbsolutePath(), true);
+            NativeCommandBridge.configure(boxFile);
             loaded = true;
             log.accept("native runtime loaded; " + configs.summary());
         } catch (Throwable error) {

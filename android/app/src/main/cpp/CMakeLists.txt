@@ -11,6 +11,9 @@ endif()
 
 set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
 set(DOBBY_DEBUG OFF CACHE BOOL "" FORCE)
+# The 1.0.5 tree defaults DOBBY_BUILD_KERNEL to ON (XNU kernel mode), which
+# pulls in <machine/limits.h>; Android builds must use the user-mode backend.
+set(DOBBY_BUILD_KERNEL OFF CACHE BOOL "" FORCE)
 set(DynamicBinaryInstrument OFF CACHE BOOL "" FORCE)
 set(Plugin.SymbolResolver OFF CACHE BOOL "" FORCE)
 set(Plugin.GlobalOffsetTableHook OFF CACHE BOOL "" FORCE)
@@ -128,7 +131,7 @@ find_library(dl_library dl REQUIRED)
 target_link_libraries(betterendfield_android PRIVATE
     c++_static
     c++abi
-    dobby
+    dobby_static
     BetterEndfield.CustomModelCore
     betterendfield_desktop_features
     ${log_library}

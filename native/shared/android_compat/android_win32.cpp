@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <dlfcn.h>
 #include <thread>
 #include <unistd.h>
@@ -81,7 +83,32 @@ std::uint32_t ProcessId() { return static_cast<std::uint32_t>(getpid()); }
 void* Il2CppImage() {
     // RTLD_NOLOAD: the client maps libil2cpp.so long before any module starts,
     // and loading a second copy would resolve exports against the wrong image.
-    static void* image = dlopen("libil2cpp.so", RTLD_NOLOAD | RTLD_NOW);
+    static void* image = [] () -> void* {
+        void* handle = dlopen("libil2cpp.so", RTLD_NOLOAD | RTLD_NOW);
+        if (handle != nullptr) return handle;
+        // The library may be registered against a module-owned class loader
+        // whose linker namespace cannot see the bare soname; resolve the
+        // absolute path from the process maps instead.
+        FILE* maps = fopen("/proc/self/maps", "r");
+        if (maps == nullptr) return nullptr;
+        char line[1024];
+        while (fgets(line, sizeof(line), maps) != nullptr) {
+            char perms[8] = {0};
+            char file[512] = {0};
+            unsigned long start = 0;
+            unsigned long end = 0;
+            if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %511s",
+                       &start, &end, perms, file) == 4) {
+                const size_t len = strlen(file);
+                if (len >= 12 && strcmp(file + len - 12, "libil2cpp.so") == 0) {
+                    handle = dlopen(file, RTLD_NOLOAD | RTLD_NOW);
+                    if (handle != nullptr) break;
+                }
+            }
+        }
+        fclose(maps);
+        return handle;
+    }();
     return image;
 }
 
