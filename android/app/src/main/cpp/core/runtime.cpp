@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "loaded_il2cpp.h"
+#include "core/log.h"
 
 #include <dlfcn.h>
 #include <link.h>
@@ -176,21 +177,43 @@ bool Il2CppRuntime::Connect() {
     const auto runtime_invoke = ResolveExport<decltype(runtime_invoke_)>(
         library, "il2cpp_runtime_invoke");
 
-    if (domain_get == nullptr || thread_attach == nullptr || thread_detach == nullptr ||
-        domain_assembly_open == nullptr || assembly_get_image == nullptr ||
-        class_from_name == nullptr || class_get_method_from_name == nullptr ||
-        class_get_methods == nullptr || method_get_name == nullptr ||
-        method_get_parameter_count == nullptr || method_get_parameter == nullptr ||
-        method_get_return_type == nullptr || type_get_name == nullptr ||
-        class_get_type == nullptr || type_get_object == nullptr ||
-        class_get_field_from_name == nullptr || field_get_offset == nullptr ||
-        field_get_value_object == nullptr ||
-        string_chars == nullptr || string_length == nullptr || string_new == nullptr ||
-        object_new == nullptr || object_unbox == nullptr ||
-        gchandle_new == nullptr || gchandle_free == nullptr ||
-        runtime_invoke == nullptr) {
-        dlclose(library);
-        return false;
+    const std::pair<const char*, const void*> required[] = {
+        {"il2cpp_domain_get", (const void*)domain_get}, {"il2cpp_thread_attach", (const void*)thread_attach},
+        {"il2cpp_thread_detach", (const void*)thread_detach}, {"il2cpp_domain_assembly_open", (const void*)domain_assembly_open},
+        {"il2cpp_assembly_get_image", (const void*)assembly_get_image}, {"il2cpp_class_from_name", (const void*)class_from_name},
+        {"il2cpp_class_get_method_from_name", (const void*)class_get_method_from_name},
+        {"il2cpp_class_get_methods", (const void*)class_get_methods}, {"il2cpp_method_get_name", (const void*)method_get_name},
+        {"il2cpp_method_get_param_count", (const void*)method_get_parameter_count},
+        {"il2cpp_method_get_param", (const void*)method_get_parameter},
+        {"il2cpp_method_get_return_type", (const void*)method_get_return_type},
+        {"il2cpp_type_get_name", (const void*)type_get_name}, {"il2cpp_class_get_type", (const void*)class_get_type},
+        {"il2cpp_type_get_object", (const void*)type_get_object},
+        {"il2cpp_class_get_field_from_name", (const void*)class_get_field_from_name},
+        {"il2cpp_field_get_offset", (const void*)field_get_offset},
+        {"il2cpp_field_get_value_object", (const void*)field_get_value_object},
+        {"il2cpp_string_chars", (const void*)string_chars}, {"il2cpp_string_length", (const void*)string_length},
+        {"il2cpp_string_new", (const void*)string_new}, {"il2cpp_object_new", (const void*)object_new},
+        {"il2cpp_value_box", (const void*)value_box}, {"il2cpp_array_new", (const void*)array_new},
+        {"il2cpp_array_new_specific", (const void*)array_new_specific},
+        {"il2cpp_object_unbox", (const void*)object_unbox}, {"il2cpp_gchandle_new", (const void*)gchandle_new},
+        {"il2cpp_gchandle_free", (const void*)gchandle_free}, {"il2cpp_runtime_invoke", (const void*)runtime_invoke},
+    };
+    {
+        std::string missing;
+        for (const auto& [name, pointer] : required) {
+            if (pointer == nullptr) {
+                missing += name;
+                missing += ' ';
+            }
+        }
+        if (!missing.empty()) {
+            static int resolve_misses = 0;
+            if (resolve_misses++ % 50 == 0) {
+                LogError("runtime.connect", ("missing exports: " + missing).c_str());
+            }
+            dlclose(library);
+            return false;
+        }
     }
 
     domain_get_assemblies_ = ResolveExport<decltype(domain_get_assemblies_)>(library, "il2cpp_domain_get_assemblies");
@@ -200,9 +223,21 @@ bool Il2CppRuntime::Connect() {
     field_get_parent_ = ResolveExport<decltype(field_get_parent_)>(library, "il2cpp_field_get_parent");
     field_get_name_ = ResolveExport<decltype(field_get_name_)>(library, "il2cpp_field_get_name");
     class_is_enum_ = ResolveExport<decltype(class_is_enum_)>(library, "il2cpp_class_is_enum");
-    if (!domain_get_assemblies_ || !image_get_name_ || !thread_current_ || !field_get_flags_) {
+    if (!thread_current_ || !field_get_flags_) {
+        static int aux_misses = 0;
+        if (aux_misses++ % 50 == 0) {
+            LogError("runtime.connect",
+                !thread_current_ ? "missing il2cpp_thread_current"
+                                 : "missing il2cpp_field_get_flags");
+        }
         dlclose(library);
         return false;
+    }
+    if (!domain_get_assemblies_) {
+        // The official 1.5.3 client does not export this symbol. FindLoadedImage
+        // falls back to il2cpp_domain_assembly_open, so keep connecting.
+        LogInfo("runtime.connect",
+            "il2cpp_domain_get_assemblies unavailable; using domain_assembly_open fallback");
     }
     library_ = library;
     domain_get_ = domain_get;
@@ -330,22 +365,31 @@ void* Il2CppRuntime::Invoke(
 }
 
 const Il2CppImage* Il2CppRuntime::FindLoadedImage(const char* name) const {
-    if (!library_ || !name || !domain_get_assemblies_ || !image_get_name_) return nullptr;
+    if (!library_ || !name) return nullptr;
     auto* domain = domain_get_();
     if (!domain) return nullptr;
-    size_t count = 0;
-    const auto** assemblies = domain_get_assemblies_(domain, &count);
-    if (!assemblies) return nullptr;
     auto normalized = [](std::string_view value) {
         if (value.ends_with(".dll")) value.remove_suffix(4);
         return value;
     };
-    for (size_t i = 0; i < count; ++i) {
-        const auto* image = assembly_get_image_(assemblies[i]);
-        const char* candidate = image ? image_get_name_(image) : nullptr;
-        if (candidate && normalized(candidate) == normalized(name)) return image;
+    if (domain_get_assemblies_ && image_get_name_) {
+        size_t count = 0;
+        const auto** assemblies = domain_get_assemblies_(domain, &count);
+        if (assemblies) {
+            for (size_t i = 0; i < count; ++i) {
+                const auto* image = assembly_get_image_(assemblies[i]);
+                const char* candidate = image ? image_get_name_(image) : nullptr;
+                if (candidate && normalized(candidate) == normalized(name)) return image;
+            }
+        }
+        return nullptr;
     }
-    return nullptr;
+    // Some shipped clients (official 1.5.3) do not export
+    // il2cpp_domain_get_assemblies; opening by name is the same loaded-image
+    // query the pre-rebuild runtime performed.
+    if (!domain_assembly_open_) return nullptr;
+    const auto* assembly = domain_assembly_open_(domain, name);
+    return assembly == nullptr ? nullptr : assembly_get_image_(assembly);
 }
 bool Il2CppRuntime::HasAssembly(const char* name) const { return FindLoadedImage(name) != nullptr; }
 void* Il2CppRuntime::CurrentThread() const { return thread_current_ ? thread_current_() : nullptr; }
