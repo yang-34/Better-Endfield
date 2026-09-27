@@ -2,6 +2,7 @@
 #include "android_virtual_keys.h"
 #include <atomic>
 #include <algorithm>
+#include <android/log.h>
 #include <unistd.h>
 namespace betterendfield {
 namespace {
@@ -15,7 +16,11 @@ bool OnAndroidFrameThread() { return g_thread.load(std::memory_order_acquire) ==
 bool HasAndroidFrameBridge() { return g_thread.load(std::memory_order_acquire) != 0; }
 void DispatchAndroidFrame() {
     pid_t unset = 0;
-    g_thread.compare_exchange_strong(unset, gettid(), std::memory_order_acq_rel);
+    const bool first = g_thread.compare_exchange_strong(unset, gettid(), std::memory_order_acq_rel);
+    if (first) {
+        __android_log_print(ANDROID_LOG_WARN, "BetterEndfield",
+            "[frame.bridge] render thread %d connected", static_cast<int>(gettid()));
+    }
     if (!OnAndroidFrameThread()) return;
     const bool suspend = g_suspend.exchange(false, std::memory_order_acq_rel) || !AndroidForeground();
     for (auto& slot : g_clients) {
